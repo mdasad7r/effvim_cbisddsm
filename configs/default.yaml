@@ -1,0 +1,29 @@
+seed: 42
+
+data:
+  splits_csv: data/processed/splits.csv
+  image_size: 224
+  batch_size: 16
+  num_workers: 2
+
+model:
+  backbone_name: tf_efficientnetv2_m.in21k_ft_in1k
+  pretrained: true
+  out_index: -1
+  mamba_dim: 256
+  mamba_layers: 4
+  mamba_d_state: 16
+  dropout: 0.1
+
+train:
+  epochs: 50
+  lr_head: 1.0e-4
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-5
+  freeze_epochs: 5
+  early_stop_patience: 8
+  amp: true
+  grad_clip: 1.0
+
+output:
+  dir: outputs
