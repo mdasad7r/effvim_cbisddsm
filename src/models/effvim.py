@@ -54,9 +54,13 @@ class EffVimClassifier(nn.Module):
 
         if self.encoder is None or self.classifier is None:
             self._build_heads(feat)
+            # move lazy-created modules to same device as feature map
+            self.encoder = self.encoder.to(feat.device)
+            self.classifier = self.classifier.to(feat.device)
 
-        z = self.encoder(feat)        # (B, dim)
-        logits = self.classifier(z)   # (B, 1)
+        z = self.encoder(feat)
+        logits = self.classifier(z)
+
         return logits
 
     def freeze_backbone(self, freeze: bool = True):
