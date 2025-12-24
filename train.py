@@ -100,6 +100,12 @@ def main():
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    # IMPORTANT: initialize lazy head (encoder + classifier) before creating optimizer
+    model.eval()
+    with torch.no_grad():
+        x0, _ = next(iter(train_loader))
+        _ = model(x0.to(device))
+
     # Stage 1: freeze backbone
     model.freeze_backbone(True)
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr_head, weight_decay=wd)
