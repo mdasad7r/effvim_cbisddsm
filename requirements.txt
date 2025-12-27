@@ -1,10 +1,11 @@
 torch
 torchvision
 timm
-pandas
 numpy
+pandas
 scikit-learn
 tqdm
 pyyaml
-Pillow
+albumentations
+opencv-python-headless
 mambapy
