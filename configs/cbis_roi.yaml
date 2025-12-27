@@ -1,0 +1,41 @@
+seed: 42
+
+data:
+  raw_dir: data/raw/cbis_ddsm
+  splits_csv: data/processed/splits.csv
+  image_size: 384          # try 224, 299, 384
+  batch_size: 16
+  num_workers: 2
+  use_clahe: true
+  sampler: weighted        # options: none, weighted
+  grayscale: true          # mammograms are grayscale, we replicate channels to 3
+
+model:
+  backbone_name: tf_efficientnetv2_m.in21k_ft_in1k   # or convnext_tiny.fb_in22k_ft_in1k
+  pretrained: true
+  out_index: -1
+  mamba_dim: 256
+  mamba_layers: 6
+  mamba_d_state: 16
+  dropout: 0.1
+
+train:
+  epochs: 50
+  lr_head: 1.0e-4
+  lr_backbone: 3.0e-5
+  weight_decay: 1.0e-4
+  freeze_epochs: 3
+  amp: true
+  grad_clip: 1.0
+  accum_steps: 1
+  scheduler: cosine        # options: cosine, plateau, none
+  early_stop_patience: 8
+  loss: focal              # options: bce, focal
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+
+eval:
+  tta: true                # horizontal flip TTA
+
+output:
+  dir: outputs
