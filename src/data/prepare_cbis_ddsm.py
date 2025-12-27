@@ -1,12 +1,11 @@
 import argparse
 import os
-from collections import defaultdict
 from pathlib import Path
+from collections import defaultdict
 
-import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
 
 
 CSV_NAMES = [
@@ -17,9 +16,8 @@ CSV_NAMES = [
 ]
 
 
-def find_first(root: str, filename: str) -> str:
-    rootp = Path(root)
-    hits = list(rootp.rglob(filename))
+def find_file(root: str, filename: str) -> str:
+    hits = list(Path(root).rglob(filename))
     if not hits:
         raise FileNotFoundError(f"Could not find {filename} under {root}")
     return str(hits[0])
@@ -30,84 +28,71 @@ def extract_uid_folder(p: str) -> str:
     return parts[-2] if len(parts) >= 2 else ""
 
 
-def choose_best_jpg(paths):
+def choose_best_img(paths):
     if not paths:
         return None
     for p in paths:
         name = os.path.basename(p).lower()
-        if ("roi" in name) or ("crop" in name) or ("cropped" in name):
+        if "roi" in name or "crop" in name or "cropped" in name:
             return p
     return paths[0]
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw_dir", required=True, help="Folder that contains csv/ and jpeg/ (Kaggle unzip output)")
-    ap.add_argument("--out_csv", required=True, help="Output CSV path, eg data/processed/splits.csv")
+    ap.add_argument("--raw_dir", required=True)
+    ap.add_argument("--out_csv", required=True)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     raw_dir = args.raw_dir
     seed = args.seed
 
-    # Locate CSVs
-    csv_paths = {name: find_first(raw_dir, name) for name in CSV_NAMES}
-
+    # Load CSVs
     dfs = []
-    for name, p in csv_paths.items():
+    for name in CSV_NAMES:
+        p = find_file(raw_dir, name)
         df = pd.read_csv(p)
         df["source_csv"] = name
         dfs.append(df)
     df = pd.concat(dfs, ignore_index=True)
 
-    # Labels
-    df["pathology"] = df["pathology"].astype(str)
-    df["label"] = df["pathology"].str.upper().str.contains("MALIGNANT").astype(int)
+    df["label"] = df["pathology"].astype(str).str.upper().str.contains("MALIGNANT").astype(int)
 
-    # Prefer ROI crops when present
-    roi_col = "cropped image file path" if "cropped image file path" in df.columns else None
-    img_col = "image file path" if "image file path" in df.columns else None
-    if roi_col is None and img_col is None:
-        raise KeyError("Could not find 'cropped image file path' or 'image file path' columns in CSVs")
-
-    use_col = roi_col if roi_col is not None else img_col
-    df["uid_folder"] = df[use_col].astype(str).apply(extract_uid_folder)
+    use_col = None
+    if "cropped image file path" in df.columns:
+        use_col = "cropped image file path"
+    elif "image file path" in df.columns:
+        use_col = "image file path"
+    else:
+        raise KeyError("No cropped/image path columns found in CBIS-DDSM CSVs")
 
     if "patient_id" not in df.columns:
-        raise KeyError("CSV must contain patient_id for patient-level split")
+        raise KeyError("patient_id column missing from CSVs")
 
-    # Locate all jpgs under jpeg/
-    jpeg_root = None
-    for cand in ["jpeg", "JPEG", "images", "Images"]:
-        cpath = os.path.join(raw_dir, cand)
-        if os.path.isdir(cpath):
-            jpeg_root = cpath
-            break
-    if jpeg_root is None:
-        jpeg_root = raw_dir  # fallback, scan all
+    df["uid_folder"] = df[use_col].astype(str).apply(extract_uid_folder)
 
-    jpgs = [str(p) for p in Path(jpeg_root).rglob("*.jpg")]
-    if not jpgs:
-        jpgs = [str(p) for p in Path(jpeg_root).rglob("*.png")]
-    if not jpgs:
-        raise FileNotFoundError(f"No .jpg/.png found under {jpeg_root}")
+    # Collect images (jpg, png)
+    img_paths = []
+    for ext in ("*.jpg", "*.png", "*.jpeg"):
+        img_paths += [str(p) for p in Path(raw_dir).rglob(ext)]
+    if not img_paths:
+        raise FileNotFoundError(f"No images found under {raw_dir}")
 
     uid_map = defaultdict(list)
-    for p in jpgs:
+    for p in img_paths:
         uid = os.path.basename(os.path.dirname(p))
         uid_map[uid].append(p)
 
     matched = []
     for _, row in tqdm(df.iterrows(), total=len(df), desc="matching"):
         uid = row["uid_folder"]
-        cand = uid_map.get(uid, [])
-        best = choose_best_jpg(cand)
-        matched.append(best)
+        matched.append(choose_best_img(uid_map.get(uid, [])))
 
     df["matched_path"] = matched
     df = df.dropna(subset=["matched_path"]).reset_index(drop=True)
 
-    # Patient-level stratified split 70/15/15
+    # Patient-level stratified 70/15/15
     patient_tbl = df.groupby("patient_id", as_index=False)["label"].max()
 
     train_pat, temp_pat = train_test_split(
@@ -116,8 +101,8 @@ def main():
         stratify=patient_tbl["label"],
         random_state=seed,
     )
-    temp_tbl = patient_tbl[patient_tbl["patient_id"].isin(temp_pat)]
 
+    temp_tbl = patient_tbl[patient_tbl["patient_id"].isin(temp_pat)]
     val_pat, test_pat = train_test_split(
         temp_tbl["patient_id"],
         test_size=0.50,
@@ -125,25 +110,25 @@ def main():
         random_state=seed,
     )
 
+    train_set = set(train_pat)
+    val_set = set(val_pat)
+
     def assign_split(pid):
-        if pid in set(train_pat):
+        if pid in train_set:
             return "train"
-        if pid in set(val_pat):
+        if pid in val_set:
             return "val"
         return "test"
 
     df["split"] = df["patient_id"].apply(assign_split)
 
-    out_csv = args.out_csv
-    Path(os.path.dirname(out_csv)).mkdir(parents=True, exist_ok=True)
+    out_csv = Path(args.out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    keep = ["split", "patient_id", "label", "matched_path", "source_csv"]
+    df[keep].to_csv(out_csv, index=False)
 
-    keep_cols = ["split", "patient_id", "label", "matched_path", "source_csv"]
-    df[keep_cols].to_csv(out_csv, index=False)
-
-    # Print stats
     print("Saved:", out_csv)
     print(df["split"].value_counts())
-    print("Label counts:")
     print(df.groupby("split")["label"].value_counts())
 
 
