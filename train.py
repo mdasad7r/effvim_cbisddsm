@@ -20,6 +20,9 @@ from src.models.eff_mamba import EffMambaClassifier
 from src.losses.focal import FocalLossWithLogits
 
 
+# ----------------------------
+# Sampling
+# ----------------------------
 def make_weighted_sampler(labels: np.ndarray) -> WeightedRandomSampler:
     labels = labels.astype(int)
     class_counts = np.bincount(labels, minlength=2)
@@ -29,8 +32,73 @@ def make_weighted_sampler(labels: np.ndarray) -> WeightedRandomSampler:
     return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
 
+# ----------------------------
+# Threshold helpers
+# ----------------------------
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def best_threshold_youden(y_true: np.ndarray, logits: np.ndarray) -> float:
+    """
+    Returns threshold on probability scale (0..1) based on Youden's J: max(TPR - FPR).
+    Falls back to 0.5 if ROC curve cannot be computed.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+
+    probs = _sigmoid_np(np.asarray(logits))
+
+    try:
+        from sklearn.metrics import roc_curve
+    except Exception:
+        return 0.5
+
+    fpr, tpr, thr = roc_curve(y_true, probs)
+    if thr is None or len(thr) == 0:
+        return 0.5
+
+    j = tpr - fpr
+    k = int(np.argmax(j))
+    return float(thr[k])
+
+
+def metrics_at_threshold(y_true: np.ndarray, logits: np.ndarray, thr: float) -> dict:
+    """
+    Computes acc/sens/spec/f1 at a given probability threshold.
+    AUC is not threshold-dependent, so we keep AUC from compute_binary_metrics_from_logits.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    probs = _sigmoid_np(np.asarray(logits))
+    y_pred = (probs >= float(thr)).astype(int)
+
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+
+    acc = float((y_pred == y_true).mean())
+    sens = float(tp / (tp + fn)) if (tp + fn) else 0.0
+    spec = float(tn / (tn + fp)) if (tn + fp) else 0.0
+    f1 = float((2 * tp) / (2 * tp + fp + fn)) if (2 * tp + fp + fn) else 0.0
+
+    return {
+        "thr": float(thr),
+        "acc": acc,
+        "sens": sens,
+        "spec": spec,
+        "f1": f1,
+        "cm": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+    }
+
+
+# ----------------------------
+# Eval (returns optional raw)
+# ----------------------------
 @torch.no_grad()
-def evaluate(model, loader, device, tta_loader=None):
+def evaluate(model, loader, device, tta_loader=None, return_raw: bool = False):
     model.eval()
     all_logits = []
     all_y = []
@@ -47,25 +115,36 @@ def evaluate(model, loader, device, tta_loader=None):
 
     if tta_loader is not None:
         all_logits_tta = []
+        n_tta = 0
         for x, _ in tta_loader:
             x = x.to(device, non_blocking=True)
             lt = model(x).squeeze(1)
             all_logits_tta.append(lt.detach().cpu())
+            n_tta += x.size(0)
         logits_tta = torch.cat(all_logits_tta).numpy()
+
+        if logits_tta.shape[0] != logits.shape[0]:
+            raise RuntimeError(
+                f"TTA size mismatch: base={logits.shape[0]} tta={logits_tta.shape[0]}. "
+                "Ensure same split and shuffle=False."
+            )
+
         logits = 0.5 * logits + 0.5 * logits_tta
 
-    return compute_binary_metrics_from_logits(y_true, logits)
+    m05 = compute_binary_metrics_from_logits(y_true, logits)
+
+    if return_raw:
+        return m05, y_true, logits
+    return m05
 
 
+# ----------------------------
+# AMP helper
+# ----------------------------
 def _make_amp_tools(use_amp: bool, device: str):
-    """
-    Returns (scaler, autocast_context).
-    Uses torch.amp when available, otherwise falls back to torch.cuda.amp.
-    """
     if not use_amp or device != "cuda":
         return None, nullcontext
 
-    # GradScaler
     scaler = None
     try:
         scaler = torch.amp.GradScaler(enabled=True)
@@ -77,6 +156,9 @@ def _make_amp_tools(use_amp: bool, device: str):
     return scaler, autocast_ctx
 
 
+# ----------------------------
+# Train
+# ----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -213,11 +295,13 @@ def main():
 
         total_loss = 0.0
         n_seen = 0
-
         opt.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs}", leave=False)
+        last_i = 0
+
         for i, (x, y) in enumerate(pbar, start=1):
+            last_i = i
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True).float().view(-1, 1)
 
@@ -249,13 +333,36 @@ def main():
             n_seen += bs_cur
             pbar.set_postfix(loss=total_loss / max(1, n_seen))
 
+        # Handle leftover gradients if len(train_loader) not divisible by accum_steps
+        if accum_steps > 1 and (last_i % accum_steps) != 0:
+            if grad_clip and grad_clip > 0:
+                if scaler is not None:
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+
         train_loss = total_loss / max(1, n_seen)
 
-        # Metrics
-        val_m = evaluate(model, val_loader, device, tta_loader=tta_val_loader)
-        test_m = evaluate(model, test_loader, device, tta_loader=tta_test_loader)
+        # Metrics at 0.5 + raw logits
+        val_m_05, val_y, val_logits = evaluate(
+            model, val_loader, device, tta_loader=tta_val_loader, return_raw=True
+        )
+        test_m_05, test_y, test_logits = evaluate(
+            model, test_loader, device, tta_loader=tta_test_loader, return_raw=True
+        )
 
-        val_auc = float(val_m["auc"]) if not np.isnan(val_m["auc"]) else -1.0
+        # Best threshold on val, apply to both val and test for display
+        best_thr = best_threshold_youden(val_y, val_logits)
+        val_m_best = metrics_at_threshold(val_y, val_logits, best_thr)
+        test_m_best = metrics_at_threshold(test_y, test_logits, best_thr)
+
+        val_auc = float(val_m_05["auc"]) if not np.isnan(val_m_05["auc"]) else -1.0
 
         # Scheduler step
         if scheduler is not None:
@@ -264,28 +371,33 @@ def main():
             else:
                 scheduler.step()
 
-        # Save checkpoint every epoch
-        epoch_path = os.path.join(outdir, f"epoch_{epoch:03d}.pt")
-        save_checkpoint(epoch_path, model, cfg, epoch, best_auc)
-
-        # Save last checkpoint (overwrites each epoch)
-        save_checkpoint(last_path, model, cfg, epoch, best_auc)
-
-        # Save best checkpoint when val AUC improves
-        if val_auc > best_auc:
+        # Update best tracking first
+        improved = val_auc > best_auc
+        if improved:
             best_auc = val_auc
             bad = 0
-            save_checkpoint(best_path, model, cfg, epoch, best_auc)
         else:
             bad += 1
+
+        # Save epoch + last always (metadata uses updated best_auc)
+        epoch_path = os.path.join(outdir, f"epoch_{epoch:03d}.pt")
+        save_checkpoint(epoch_path, model, cfg, epoch, best_auc)
+        save_checkpoint(last_path, model, cfg, epoch, best_auc)
+
+        # Save best when improved
+        if improved:
+            save_checkpoint(best_path, model, cfg, epoch, best_auc)
 
         # Log
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
-            "val": val_m,
-            "test": test_m,
             "best_val_auc": best_auc,
+            "val": val_m_05,              # keep backward compatible
+            "test": test_m_05,            # keep backward compatible
+            "best_thr": best_thr,
+            "val_bestthr": {**val_m_best, "auc": float(val_m_05.get("auc", float("nan")))},
+            "test_bestthr": {**test_m_best, "auc": float(test_m_05.get("auc", float("nan")))},
             "saved": {
                 "epoch_ckpt": os.path.basename(epoch_path),
                 "best_ckpt": os.path.basename(best_path),
@@ -297,8 +409,10 @@ def main():
 
         print(
             f"Epoch {epoch:03d} | loss {train_loss:.4f} | "
-            f"val auc {val_m['auc']:.4f} acc {val_m['acc']:.4f} sens {val_m['sens']:.4f} spec {val_m['spec']:.4f} | "
-            f"test auc {test_m['auc']:.4f} acc {test_m['acc']:.4f} | "
+            f"val auc {val_m_05['auc']:.4f} | "
+            f"val@0.5 acc {val_m_05['acc']:.4f} sens {val_m_05['sens']:.4f} spec {val_m_05['spec']:.4f} | "
+            f"val@thr={best_thr:.3f} acc {val_m_best['acc']:.4f} sens {val_m_best['sens']:.4f} spec {val_m_best['spec']:.4f} | "
+            f"test@thr acc {test_m_best['acc']:.4f} sens {test_m_best['sens']:.4f} spec {test_m_best['spec']:.4f} | "
             f"best val auc {best_auc:.4f}"
         )
 
